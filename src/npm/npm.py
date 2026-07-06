@@ -1,63 +1,113 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 # third-party imports
 from depsight.core.plugins.base import BasePlugin
 from depsight.core.plugins.dependency import Dependency
 
-# TODO: RENAME "MyPlugin" TO "NpmPlugin"
-class MyPlugin(BasePlugin):
-    """Example third-party plugin for depsight."""
+
+class NpmPlugin(BasePlugin):
+    """Third-party npm plugin for depsight."""
 
     def __init__(self) -> None:
         self.dependencies: list[Dependency] = []
 
     @property
     def name(self) -> str:
-        # TODO: Replace the name to "npm"
-        return "myplugin"
+        return "npm"
 
     @property
     def dependency_files(self) -> tuple[str, ...]:
-        # TODO: Add "package-lock.json"to the tuple
-        return ("",)
+        return ("package-lock.json",)
 
     @property
     def default_file(self) -> str:
-        # TODO: Return "package-lock.json" once dependency_files is updated
         return self.dependency_files[0]
 
     def collect(self, project_dir: str | Path, file: str | None = None) -> None:
-        """Return two fake dependencies for testing."""
-        # TODO: Parse dependencies from a 'package-lock.json' file.
-        # Implementation guidance:
-        # - Locate and load the 'package-lock.json' from the given project directory.
-        # - Read the JSON content and detect the lockfile format version.
+        """Parse dependencies from a ``package-lock.json`` file."""
+        file = file or self.default_file
+        lockfile = Path(project_dir) / file
 
-        # For npm v2/v3 (preferred approach):
-        # - Use the top-level "packages" field.
-        # - Iterate over all entries in "packages".
-        # - Skip the root entry identified by an empty string key ("").
-        # - Only consider entries under "node_modules/...".
-        # - Extract the dependency name from the path:
-        #     e.g. "node_modules/lodash" → "lodash"
-        #          "node_modules/@scope/pkg" → "@scope/pkg"
-        # - Read the resolved version from the "version" field.
-        # - Create a Dependency(name, version, tool_name=self.name) for each entry.
+        self.dependencies = []
 
-        # For npm v1 (fallback):
-        # - Use the nested "dependencies" field.
-        # - Recursively traverse all dependency objects.
-        # - Extract "name" (key) and "version" from each node.
+        if not lockfile.is_file():
+            return
 
-        # General rules:
-        # - Do NOT resolve versions manually; always use the locked version.
-        # - Skip entries without a valid "version".
-        # - Ensure each dependency is added only once (avoid duplicates).
-        # - Store results in self.dependencies.
+        with lockfile.open(encoding="utf-8") as fh:
+            data = json.load(fh)
 
-        self.dependencies = [
-            Dependency(name="foo", version="1.0.0", tool_name=self.name),
-            Dependency(name="bar", version="2.0.0", tool_name=self.name),
-        ]
+        lockfile_path = str(lockfile)
+
+        packages = data.get("packages")
+        if packages:
+            self._collect_from_packages(packages, lockfile_path)
+        else:
+            self._collect_from_dependencies(
+                data.get("dependencies", {}), lockfile_path
+            )
+
+    def _collect_from_packages(
+        self, packages: dict[str, dict], lockfile_path: str
+    ) -> None:
+        """Collect dependencies from the ``packages`` field (npm v2/v3)."""
+        root = packages.get("", {})
+        direct = root.get("dependencies", {})
+        dev_direct = root.get("devDependencies", {})
+        constraints = {**direct, **dev_direct}
+
+        seen: set[str] = set()
+        for key, meta in packages.items():
+            # Skip the root entry and anything not installed under node_modules.
+            if key == "" or "node_modules/" not in key:
+                continue
+
+            name = key.split("node_modules/")[-1]
+            version = meta.get("version")
+            if not version or name in seen:
+                continue
+            seen.add(name)
+
+            is_dev = bool(meta.get("dev")) or name in dev_direct
+            self.dependencies.append(
+                Dependency(
+                    name=name,
+                    version=version,
+                    constraint=constraints.get(name),
+                    tool_name=self.name,
+                    registry=meta.get("resolved"),
+                    file=lockfile_path,
+                    category="dev" if is_dev else "prod",
+                    is_transitive=name not in direct and name not in dev_direct,
+                )
+            )
+
+    def _collect_from_dependencies(
+        self, dependencies: dict[str, dict], lockfile_path: str
+    ) -> None:
+        """Collect dependencies from the nested ``dependencies`` field (npm v1)."""
+        seen: set[str] = set()
+
+        def walk(deps: dict[str, dict], is_transitive: bool) -> None:
+            for name, meta in deps.items():
+                version = meta.get("version")
+                if version and name not in seen:
+                    seen.add(name)
+                    self.dependencies.append(
+                        Dependency(
+                            name=name,
+                            version=version,
+                            tool_name=self.name,
+                            registry=meta.get("resolved"),
+                            file=lockfile_path,
+                            category="dev" if meta.get("dev") else "prod",
+                            is_transitive=is_transitive,
+                        )
+                    )
+                nested = meta.get("dependencies")
+                if nested:
+                    walk(nested, True)
+
+        walk(dependencies, False)
